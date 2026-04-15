@@ -153,6 +153,13 @@ struct fmha_vsa_fwd_args
     ck_tile::index_t window_size_right;
     ck_tile::index_t mask_type;
 
+    // Option 2: SLA Q-block size hint. The fwd dispatcher uses this
+    // to pick between tile instances — block_m=64 selects the
+    // (kM0=64, kN0=64) tile (Config A/B), block_m=128 selects the
+    // (kM0=128, kN0=64) tile (Config C). Defaults to 128 for
+    // back-compat with callers that don't set it explicitly.
+    ck_tile::index_t block_m = 128;
+
     // Dropout is not supported for sparse attention; keep args minimal.
 };
 

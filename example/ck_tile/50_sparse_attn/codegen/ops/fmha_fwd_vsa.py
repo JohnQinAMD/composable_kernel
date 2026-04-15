@@ -76,20 +76,26 @@ using fmha_shape_{F_idx} = ck_tile::TileFmhaShape<fmha_block_tile_{F_idx},
                                       ck_tile::sequence<{F_wm1}, {F_wn1}, {F_wk1}>,
                                       {F_vlayout}>;
 
-// TileFmhaTraits: spad, skpad, dpad, dvpad, has_logits_soft_cap, bias_enum,
-//                 store_lse, has_dropout, has_randval, quant_scale_enum, occupancy, is_v_rowmajor_skip
+// TileFmhaTraits template params in order:
+//   spad, skpad, dpad, dvpad, has_logits_soft_cap, bias_enum,
+//   has_bias_grad, store_lse, has_dropout, quant_scale_enum,
+//   block_per_cu (occupancy), skip_min_seqlen_q, has_sink
+// NOTE: Prior version of this template dropped has_bias_grad and so the
+// store_lse flag was being read as has_bias_grad by the compiler. Fixed
+// during Stage 7 Tier 1.
 using fmha_trait_{F_idx} = ck_tile::TileFmhaTraits<{F_spad},
                                                     {F_skpad},
                                                     {F_dpad},
                                                     {F_dvpad},
                                                     false,  // has_logits_soft_cap - NOT supported
                                                     ck_tile::BlockAttentionBiasEnum::NO_BIAS,  // bias - NOT supported
-                                                    false,  // store_lse - NOT supported
+                                                    false,  // has_bias_grad - NOT supported (fwd only)
+                                                    true,   // store_lse - enabled (Stage 7 Tier 1)
                                                     false,  // has_dropout - NOT supported
-                                                    false,  // has_randval - NOT supported
                                                     ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,  // FP8 quant - NOT supported
                                                     {F_occupancy},
-                                                    false>;
+                                                    false,  // skip_min_seqlen_q
+                                                    false>;  // has_sink
 
 using fmha_variant_{F_idx} = ck_tile::ComposedAttention<0, CK_TILE_FMHA_FWD_FAST_EXP2>;  // logits_soft_cap=0 (NOT supported)
 
@@ -274,10 +280,14 @@ class FmhaFwdApiTrait:
 
     @property
     def seqtune(self) -> str:
+        # Option 2: VSA tile selection is driven by SLA's BLKQ (exposed as
+        # a.block_m) rather than seqlen_q bucketing. Config C maps BLKQ=128
+        # to the (kM0=128) tile; Config A/B maps BLKQ=64 to the (kM0=64)
+        # tile. The bm0=128 tile also acts as a fallback for callers that
+        # leave a.block_m at its default (which is 128).
         if self.bm0 == 128:
-            return "true/*fall back to largest tile*/"  # group mode only generate spad/skpad == true
-        else:
-            return f"a.seqlen_q <= {self.bm0}"
+            return "(a.block_m == 128 || a.block_m == 0)"
+        return f"a.block_m == {self.bm0}"
 
     @property
     def skcheck(self) -> str:
@@ -629,12 +639,47 @@ class KernelComponentFactory:
                         64,
                         32,
                         128,
-                        16,
+                        32,  # kK1=32 (was 16; 16 triggers LDS descriptor assertion with VSA policy)
                         128,
                         4,
                         1,
                         1,
                         4,
+                        1,
+                        1,
+                        32,
+                        32,
+                        16,
+                        32,
+                        32,
+                        16,
+                        -1,
+                    ),
+                    # Option 2: (kM0=64, kN0=64) tile for SLA Config A/B.
+                    # kM0=64 matches SLA's BLKQ=64 exactly (no q_scale
+                    # expansion). Block warps (2,1,1) give 2 warps per
+                    # block, each doing a 32-row × 64-col slice of Gemm0
+                    # (= 1 × 2 mfma ops at warp tile 32×32×16) and a
+                    # 32-row × 32-col slice of Gemm1's A-tile (= 1 × 1
+                    # mfma). Using only 2 warps drops the block size to
+                    # 128 lanes — lower occupancy than the 4-warp (128,64)
+                    # instance but simpler warp-layout matching for both
+                    # gemms. The (2,2,1) layout I tried first was rejected
+                    # by block_gemm_areg_bsmem_creg_v2 because Gemm1's
+                    # A-tile (bm0×bk1 = 64×32) doesn't cleanly tile across
+                    # 4 warps at warp-tile 32×32.
+                    # Selected when a.block_m == 64 via the seqtune dispatcher.
+                    FmhaFwdTileSize(  # fmt: skip
+                        64,
+                        64,
+                        32,
+                        128,
+                        32,
+                        128,
+                        2,
+                        1,
+                        1,
+                        2,
                         1,
                         1,
                         32,
@@ -780,7 +825,14 @@ def get_fwd_blobs(
             for tile, pipeline in itertools.product(
                 tiles, factory.get_pipelines(dtype, hdim, hdim_v, receipt, mask_impl)
             ):
-                if tile.F_bm0 != 128 or tile.F_bn0 != 128:
+                # Option 2: allow both (128, 64) for Config C and
+                # (64, 64) for Config A/B. Other tile shapes in the
+                # library are still skipped because the VSA pipeline
+                # hasn't been validated against them.
+                if not (
+                    (tile.F_bm0 == 128 and tile.F_bn0 == 64)
+                    or (tile.F_bm0 == 64 and tile.F_bn0 == 64)
+                ):
                     continue
                 if pipeline.tag != "qr_async_vsa":
                     continue
