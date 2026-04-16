@@ -121,6 +121,7 @@ struct fmha_vsa_fwd_args
     const void* lut_ptr; // delta-encoded K-block indices per Q-block, int32 [B,H,Q_blk,K_blk]
     const void* valid_block_num_ptr; // valid K-block count per Q-block, int32 [B,H,Q_blk]
     void* o_ptr;
+    void* lse_ptr = nullptr; // fp32 [B, H, seqlen_q]; may be nullptr when LSE output is disabled
 
     ck_tile::index_t seqlen_q;
     ck_tile::index_t seqlen_k;
@@ -141,14 +142,23 @@ struct fmha_vsa_fwd_args
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_lse = 0;
     ck_tile::index_t batch_stride_q;
     ck_tile::index_t batch_stride_k;
     ck_tile::index_t batch_stride_v;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_lse = 0;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;
     ck_tile::index_t mask_type;
+
+    // Option 2: SLA Q-block size hint. The fwd dispatcher uses this
+    // to pick between tile instances — block_m=64 selects the
+    // (kM0=64, kN0=64) tile (Config A/B), block_m=128 selects the
+    // (kM0=128, kN0=64) tile (Config C). Defaults to 128 for
+    // back-compat with callers that don't set it explicitly.
+    ck_tile::index_t block_m = 128;
 
     // Dropout is not supported for sparse attention; keep args minimal.
 };
@@ -199,6 +209,7 @@ auto fmha_fwd_create_kargs_and_grids(fmha_vsa_fwd_args args)
                                        args.lut_ptr,
                                        args.valid_block_num_ptr,
                                        args.o_ptr,
+                                       args.lse_ptr,
                                        args.seqlen_q,
                                        args.seqlen_k,
                                        args.hdim_q,
@@ -214,10 +225,12 @@ auto fmha_fwd_create_kargs_and_grids(fmha_vsa_fwd_args args)
                                        args.nhead_stride_k,
                                        args.nhead_stride_v,
                                        args.nhead_stride_o,
+                                       args.nhead_stride_lse,
                                        args.batch_stride_q,
                                        args.batch_stride_k,
                                        args.batch_stride_v,
                                        args.batch_stride_o,
+                                       args.batch_stride_lse,
                                        args.window_size_left,
                                        args.window_size_right,
                                        args.mask_type);
@@ -326,3 +339,104 @@ template <typename Traits_>
 float fmha_vsa_fwd_(const ck_tile::stream_config&, fmha_vsa_fwd_args);
 
 float fmha_vsa_fwd(fmha_vsa_fwd_args, const ck_tile::stream_config&);
+
+// =====================================================================
+// VSA sparse BACKWARD args (Stage 7 Tier 2).
+// =====================================================================
+// Shapes (all int32 unless noted):
+//   q, k, v, o, do : [B, H, S, D] (i_perm = true)
+//   dq, dk, dv     : [B, H, S, D] (gradient outputs)
+//   lse, d         : [B, H, S]    fp32 (fwd LSE + preprocess delta)
+//   dq_acc         : [B, H, nsplits, S, D] fp32 split-K accumulator
+//   kq_lut         : [B, H, K_blocks, max_kn_count] int32 (transposed LUT)
+//   kn_count       : [B, H, K_blocks] int32 (# of active Q-blocks per K-block)
+struct fmha_vsa_bwd_args
+{
+    // inputs from fwd
+    const void* q_ptr;
+    const void* k_ptr;
+    const void* v_ptr;
+    const void* o_ptr;            // fwd output (for δ preprocess)
+    const void* lse_ptr;          // log2-space LSE from fwd, fp32
+    const void* do_ptr;           // gradient wrt output
+    void* d_ptr;                  // fp32 δ = rowsum(dO ⊙ O), preprocess writes it
+    void* dq_acc_ptr;             // fp32 split-K accumulator
+    void* dq_ptr;                 // final dQ (bf16/fp16)
+    void* dk_ptr;
+    void* dv_ptr;
+
+    // VSA sparse metadata (transposed K-major LUT — consumed by the
+    // dkdv-only half of the split bwd).
+    const void* kq_lut_ptr;
+    const void* kn_count_ptr;
+    ck_tile::index_t max_kn_count;
+
+    // M-major LUT (Tier 2.5 Step 1c — consumed by the dq-only half of
+    // the split bwd). SLA uses a fixed-topk layout: every row has exactly
+    // `kv_blocks_per_row` absolute K-block indices. `q_scale` = BLKQ /
+    // VSA_BWD_KM0 — when > 1, several CK Q-tiles share one SLA LUT row.
+    const void* kv_block_idx_ptr          = nullptr;
+    ck_tile::index_t kv_blocks_per_row    = 0;
+    ck_tile::index_t q_scale              = 1;
+
+    ck_tile::index_t seqlen_q;
+    ck_tile::index_t seqlen_k;
+    ck_tile::index_t batch;
+    ck_tile::index_t max_seqlen_q;
+    ck_tile::index_t hdim_q;
+    ck_tile::index_t hdim_v;
+    ck_tile::index_t nhead_q;
+    ck_tile::index_t nhead_k;
+
+    float scale_s;
+
+    // strides (same layout as fwd for shared tensors)
+    ck_tile::index_t stride_q;
+    ck_tile::index_t stride_k;
+    ck_tile::index_t stride_v;
+    ck_tile::index_t stride_o;
+    ck_tile::index_t stride_do;
+    ck_tile::index_t stride_dq;
+    ck_tile::index_t stride_dk;
+    ck_tile::index_t stride_dv;
+    ck_tile::index_t stride_dq_acc;
+
+    ck_tile::index_t nhead_stride_q;
+    ck_tile::index_t nhead_stride_k;
+    ck_tile::index_t nhead_stride_v;
+    ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_do;
+    ck_tile::index_t nhead_stride_lsed;
+    ck_tile::long_index_t nhead_stride_dq_acc;
+    ck_tile::index_t nhead_stride_dk;
+    ck_tile::index_t nhead_stride_dv;
+    ck_tile::index_t nhead_stride_kq_lut;
+    ck_tile::index_t nhead_stride_kn_count;
+    ck_tile::index_t nhead_stride_dq      = 0;
+    ck_tile::index_t nhead_stride_kv_idx  = 0;
+
+    ck_tile::index_t batch_stride_q;
+    ck_tile::index_t batch_stride_k;
+    ck_tile::index_t batch_stride_v;
+    ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_do;
+    ck_tile::index_t batch_stride_lsed;
+    ck_tile::long_index_t batch_stride_dq_acc;
+    ck_tile::index_t batch_stride_dk;
+    ck_tile::index_t batch_stride_dv;
+    ck_tile::index_t batch_stride_kq_lut;
+    ck_tile::index_t batch_stride_kn_count;
+    ck_tile::index_t batch_stride_dq      = 0;
+    ck_tile::index_t batch_stride_kv_idx  = 0;
+};
+
+struct fmha_vsa_bwd_traits
+{
+    int hdim_q;
+    int hdim_v;
+    std::string data_type;
+    bool is_v_rowmajor;
+    mask_enum mask_type;
+};
+
+float fmha_vsa_bwd(fmha_vsa_bwd_traits, fmha_vsa_bwd_args, const ck_tile::stream_config&);
