@@ -65,7 +65,7 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
     static_assert(BiasEnum == BlockAttentionBiasEnum::NO_BIAS,
                   "VSA sparse attention does not support bias.");
     static_assert(!kHasDropout, "VSA sparse attention does not support dropout.");
-    static_assert(!kStoreLSE, "VSA sparse attention does not support LSE output.");
+    // LSE output is now supported via the kStoreLSE template flag.
     static_assert(!kHasLogitsSoftCap, "VSA sparse attention does not support logits soft-cap.");
 
     // last dimension vector length used to create tensor view(and decide buffer_load vector length)
@@ -139,6 +139,7 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
     template <typename QDramBlockWindowTmp,
               typename KDramBlockWindowTmp,
               typename VDramBlockWindowTmp,
+              typename LSEDramBlockWindowTmp,
               typename AttentionVariantParams,
               typename BlockIndices>
     CK_TILE_HOST_DEVICE auto
@@ -147,6 +148,7 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
                const VDramBlockWindowTmp& v_dram_block_window_tmp, // N1*K1 tile
                const int* kv_block_idx_ptr,
                int kv_blocks,
+               LSEDramBlockWindowTmp& lse_dram_window_tmp, // M0*1 tile (null when !kStoreLSE)
                FmhaMask mask,
                float scale_s,
                const AttentionVariant& variant,
@@ -200,7 +202,12 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
         constexpr auto gemm_0 = Policy::template GetQKBlockGemm<Problem>();
         constexpr auto gemm_1 = Policy::template GetKVBlockGemm<Problem>();
 
-        int seqlen_k_start = kv_block_idx_ptr[0] * kM0;
+        // NOTE: original code was `kv_block_idx_ptr[0] * kM0`, which only works
+        // when kM0 == kN0 (square Q/K tiles). With an asymmetric tile
+        // (kM0=128, kN0=64 as patched for SLA), the LUT values are K-block
+        // indices in units of kN0 and the subsequent iteration step at lines
+        // 529-530 also uses kN0. The starting offset must match.
+        int seqlen_k_start = kv_block_idx_ptr[0] * kN0;
         auto q_dram_window = make_tile_window(q_dram_block_window_tmp.get_bottom_tensor_view(),
                                               q_dram_block_window_tmp.get_window_lengths(),
                                               q_dram_block_window_tmp.get_window_origin(),
@@ -552,6 +559,31 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
                         sequence<(LdsSeq.at(number<k0_loops + k1_loops - 1>{}) + 1) * kN1, kK1>{}));
             }
         } while(i_total_loops < num_total_loop);
+
+        // Store LSE in log2-space:  lse = scale_s * m + log2(l).
+        //   * m  is the raw row-max of s_acc = q @ k^T (pre-scale).
+        //   * l  is the running sum of exp2(scale_s * (s - m)).
+        //   * scale_s kargs is already scale_s_orig * log2e when
+        //     CK_TILE_FMHA_FWD_FAST_EXP2 is set.
+        // Consumers that expect natural-log LSE can multiply by ln(2).
+        if constexpr(kStoreLSE)
+        {
+            auto lse = make_static_distributed_tensor<LSEDataType>(m.get_tile_distribution());
+
+            constexpr auto lse_spans = decltype(lse)::get_distributed_spans();
+            sweep_tile_span(lse_spans[number<0>{}], [&, m_ = m, l_ = l](auto idx0) {
+                constexpr auto i_idx = make_tuple(idx0);
+#if CK_TILE_FMHA_FWD_FAST_EXP2
+                // log2-space LSE: scale_s*m + log2(l). Use log(l) * log2e for log2.
+                lse(i_idx) = scale_s * m_[i_idx] +
+                             log(l_[i_idx]) * ck_tile::log2e_v<SMPLComputeDataType>;
+#else
+                lse(i_idx) = scale_s * m_[i_idx] + log(l_[i_idx]);
+#endif
+            });
+
+            store_tile(lse_dram_window_tmp, lse);
+        }
 
         // finally, O
         constexpr auto o_spans = decltype(o_acc)::get_distributed_spans();

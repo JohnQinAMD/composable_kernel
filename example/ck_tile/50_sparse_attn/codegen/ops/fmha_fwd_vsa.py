@@ -76,20 +76,23 @@ using fmha_shape_{F_idx} = ck_tile::TileFmhaShape<fmha_block_tile_{F_idx},
                                       ck_tile::sequence<{F_wm1}, {F_wn1}, {F_wk1}>,
                                       {F_vlayout}>;
 
-// TileFmhaTraits: spad, skpad, dpad, dvpad, has_logits_soft_cap, bias_enum,
-//                 store_lse, has_dropout, has_randval, quant_scale_enum, occupancy, is_v_rowmajor_skip
+// TileFmhaTraits template params in order:
+//   spad, skpad, dpad, dvpad, has_logits_soft_cap, bias_enum,
+//   has_bias_grad, store_lse, has_dropout, quant_scale_enum,
+//   block_per_cu (occupancy), skip_min_seqlen_q, has_sink
 using fmha_trait_{F_idx} = ck_tile::TileFmhaTraits<{F_spad},
                                                     {F_skpad},
                                                     {F_dpad},
                                                     {F_dvpad},
-                                                    false,  // has_logits_soft_cap - NOT supported
-                                                    ck_tile::BlockAttentionBiasEnum::NO_BIAS,  // bias - NOT supported
-                                                    false,  // store_lse - NOT supported
-                                                    false,  // has_dropout - NOT supported
-                                                    false,  // has_randval - NOT supported
+                                                    false,  // has_logits_soft_cap
+                                                    ck_tile::BlockAttentionBiasEnum::NO_BIAS,
+                                                    false,  // has_bias_grad
+                                                    true,   // store_lse
+                                                    false,  // has_dropout
                                                     ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,  // FP8 quant - NOT supported
                                                     {F_occupancy},
-                                                    false>;
+                                                    false,  // skip_min_seqlen_q
+                                                    false>;  // has_sink
 
 using fmha_variant_{F_idx} = ck_tile::ComposedAttention<0, CK_TILE_FMHA_FWD_FAST_EXP2>;  // logits_soft_cap=0 (NOT supported)
 
@@ -274,10 +277,12 @@ class FmhaFwdApiTrait:
 
     @property
     def seqtune(self) -> str:
+        # VSA tile selection is driven by the caller's block_m (set from
+        # SLA's BLKQ), not by seqlen_q bucketing. The bm0=128 tile acts
+        # as the fallback when block_m is zero/default.
         if self.bm0 == 128:
-            return "true/*fall back to largest tile*/"  # group mode only generate spad/skpad == true
-        else:
-            return f"a.seqlen_q <= {self.bm0}"
+            return "(a.block_m == 128 || a.block_m == 0)"
+        return f"a.block_m == {self.bm0}"
 
     @property
     def skcheck(self) -> str:
@@ -627,14 +632,44 @@ class KernelComponentFactory:
                     FmhaFwdTileSize(  # fmt: skip
                         128,
                         64,
+                        64,  # kK0=64
+                        128,
                         32,
                         128,
+                        4,
+                        1,
+                        1,
+                        4,
+                        1,
+                        1,
+                        32,
+                        32,
                         16,
+                        32,
+                        32,
+                        16,
+                        -1,
+                    ),
+                    # (kM0=64, kN0=64) tile for BLKQ=64 callers.
+                    # kM0 matches the caller's BLKQ exactly (q_scale=1).
+                    # 2-warp (2,1,1) block layout: the VSA pipeline's LDS
+                    # descriptors are tuned for 32-wide warp tiles, and
+                    # narrower 4-warp variants (e.g., 16x16x32) regress
+                    # because mfma_16x16x* multiplies the MFMA issue count
+                    # without a corresponding LDS bandwidth gain on this
+                    # (64, 64, 32) block size.
+                    # Selected when a.block_m == 64 via the seqtune dispatcher.
+                    FmhaFwdTileSize(  # fmt: skip
+                        64,
+                        64,
+                        32,
                         128,
-                        4,
+                        32,
+                        128,
+                        2,
                         1,
                         1,
-                        4,
+                        2,
                         1,
                         1,
                         32,
@@ -780,7 +815,12 @@ def get_fwd_blobs(
             for tile, pipeline in itertools.product(
                 tiles, factory.get_pipelines(dtype, hdim, hdim_v, receipt, mask_impl)
             ):
-                if tile.F_bm0 != 128 or tile.F_bn0 != 128:
+                # Only the (128, 64) and (64, 64) tiles are validated
+                # for the VSA pipeline; skip other shapes.
+                if not (
+                    (tile.F_bm0 == 128 and tile.F_bn0 == 64)
+                    or (tile.F_bm0 == 64 and tile.F_bn0 == 64)
+                ):
                     continue
                 if pipeline.tag != "qr_async_vsa":
                     continue

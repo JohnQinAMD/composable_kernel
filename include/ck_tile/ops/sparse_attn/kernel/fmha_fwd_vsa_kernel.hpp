@@ -57,7 +57,9 @@ struct FmhaFwdVSAKernel
     static_assert(!FmhaPipeline::kIsGroupMode, "VSA sparse attention supports batch mode only.");
     static_assert(BiasEnum == BlockAttentionBiasEnum::NO_BIAS,
                   "VSA sparse attention does not support bias.");
-    static_assert(!kStoreLSE, "VSA sparse attention does not support LSE output.");
+    // LSE output is now supported: kStoreLSE plumbs through FmhaFwdCommonLSEKargs
+    // and writes m + log(l) to lse_ptr at the end of the pipeline. See the
+    // dense fmha_fwd_kernel.hpp for the reference pattern.
     static_assert(!kHasDropout, "VSA sparse attention does not support dropout.");
     static_assert(!kHasLogitsSoftCap, "VSA sparse attention does not support logits soft-cap.");
     static_assert(!kDoFp8StaticQuant,
@@ -115,9 +117,19 @@ struct FmhaFwdVSAKernel
         ck_tile::GenericAttentionMaskEnum mask_type;
     };
 
+    // LSE output kargs (active when kStoreLSE = true). Mirrors the dense
+    // fmha_fwd_kernel.hpp FmhaFwdCommonLSEKargs so tooling stays consistent.
+    struct FmhaFwdCommonLSEKargs
+    {
+        void* lse_ptr                     = nullptr;
+        ck_tile::index_t nhead_stride_lse = 0;
+        ck_tile::index_t batch_stride_lse = 0;
+    };
+
     struct FmhaFwdBatchModeKargs
         : FmhaFwdCommonKargs,
-          std::conditional_t<kHasMask, FmhaFwdMaskKargs, FmhaFwdEmptyKargs<1>>
+          std::conditional_t<kHasMask, FmhaFwdMaskKargs, FmhaFwdEmptyKargs<1>>,
+          std::conditional_t<kStoreLSE, FmhaFwdCommonLSEKargs, FmhaFwdEmptyKargs<2>>
     {
         ck_tile::index_t batch_stride_q;
         ck_tile::index_t batch_stride_k;
@@ -141,6 +153,7 @@ struct FmhaFwdVSAKernel
                                                   const void* lut_ptr,
                                                   const void* valid_block_num_ptr,
                                                   void* o_ptr,
+                                                  void* lse_ptr,
                                                   ck_tile::index_t seqlen_q,
                                                   ck_tile::index_t seqlen_k,
                                                   ck_tile::index_t hdim_q,
@@ -156,10 +169,12 @@ struct FmhaFwdVSAKernel
                                                   ck_tile::index_t nhead_stride_k,
                                                   ck_tile::index_t nhead_stride_v,
                                                   ck_tile::index_t nhead_stride_o,
+                                                  ck_tile::index_t nhead_stride_lse,
                                                   ck_tile::index_t batch_stride_q,
                                                   ck_tile::index_t batch_stride_k,
                                                   ck_tile::index_t batch_stride_v,
                                                   ck_tile::index_t batch_stride_o,
+                                                  ck_tile::index_t batch_stride_lse,
                                                   ck_tile::index_t window_size_left,
                                                   ck_tile::index_t window_size_right,
                                                   ck_tile::index_t mask_type)
@@ -190,6 +205,7 @@ struct FmhaFwdVSAKernel
                      nhead_stride_v,
                      nhead_stride_o}, // FmhaFwdCommonKargs
                     {},               // FmhaFwdMaskKargs or FmhaFwdEmptyKargs<1>
+                    {},               // FmhaFwdCommonLSEKargs or FmhaFwdEmptyKargs<2>
                     batch_stride_q,
                     batch_stride_k,
                     batch_stride_v,
@@ -200,6 +216,12 @@ struct FmhaFwdVSAKernel
             kargs.window_size_left  = window_size_left;
             kargs.window_size_right = window_size_right;
             kargs.mask_type         = static_cast<ck_tile::GenericAttentionMaskEnum>(mask_type);
+        }
+        if constexpr(kStoreLSE)
+        {
+            kargs.lse_ptr          = lse_ptr;
+            kargs.nhead_stride_lse = nhead_stride_lse;
+            kargs.batch_stride_lse = batch_stride_lse;
         }
         return kargs;
     }
@@ -260,15 +282,20 @@ struct FmhaFwdVSAKernel
         const index_t i_m0 = __builtin_amdgcn_readfirstlane(i_tile_m * FmhaPipeline::kM0);
         const index_t i_n1 = __builtin_amdgcn_readfirstlane(i_tile_n * FmhaPipeline::kN1);
 
-        long_index_t batch_offset_q = 0;
-        long_index_t batch_offset_k = 0;
-        long_index_t batch_offset_v = 0;
-        long_index_t batch_offset_o = 0;
+        long_index_t batch_offset_q   = 0;
+        long_index_t batch_offset_k   = 0;
+        long_index_t batch_offset_v   = 0;
+        long_index_t batch_offset_o   = 0;
+        long_index_t batch_offset_lse = 0;
 
         batch_offset_q = static_cast<long_index_t>(i_batch) * kargs.batch_stride_q;
         batch_offset_k = static_cast<long_index_t>(i_batch) * kargs.batch_stride_k;
         batch_offset_v = static_cast<long_index_t>(i_batch) * kargs.batch_stride_v;
         batch_offset_o = static_cast<long_index_t>(i_batch) * kargs.batch_stride_o;
+        if constexpr(kStoreLSE)
+        {
+            batch_offset_lse = static_cast<long_index_t>(i_batch) * kargs.batch_stride_lse;
+        }
 
         // for simplicity, batch stride we just modify the pointer
         const QDataType* q_ptr = reinterpret_cast<const QDataType*>(kargs.q_ptr) +
@@ -394,6 +421,38 @@ struct FmhaFwdVSAKernel
                 return FmhaMask{kargs.seqlen_q, kargs.seqlen_k};
         }();
 
+        // LSE dram window: M0 × 1 tile into [B, H, S] layout. When kStoreLSE is
+        // false the lambda returns a null_tile_window, which the pipeline's
+        // store_tile short-circuits at compile time.
+        auto lse_dram_window = [&, i_nhead_ = i_nhead]() {
+            constexpr auto lse_dram_window_lengths = make_tuple(number<FmhaPipeline::kM0>{});
+            if constexpr(kStoreLSE)
+            {
+                LSEDataType* lse_ptr =
+                    reinterpret_cast<LSEDataType*>(kargs.lse_ptr) +
+                    static_cast<long_index_t>(i_nhead_) * kargs.nhead_stride_lse +
+                    batch_offset_lse;
+
+                const auto lse_dram = [&]() {
+                    const auto lse_dram_naive =
+                        make_naive_tensor_view<address_space_enum::global>(
+                            lse_ptr,
+                            make_tuple(kargs.seqlen_q),
+                            make_tuple(1),
+                            number<1>{},
+                            number<1>{});
+                    return pad_tensor_view(
+                        lse_dram_naive, lse_dram_window_lengths, sequence<kPadSeqLenQ>{});
+                }();
+
+                return make_tile_window(lse_dram, lse_dram_window_lengths, {i_m0});
+            }
+            else
+            {
+                return make_null_tile_window(lse_dram_window_lengths);
+            }
+        }();
+
         AttentionVariant variant;
         const auto variant_params = ck_tile::StandardAttentionParams<FmhaMask>{mask, kargs.scale_s};
 
@@ -404,6 +463,7 @@ struct FmhaFwdVSAKernel
                                          v_dram_window,
                                          lut_ptr,
                                          valid_block_num_value,
+                                         lse_dram_window,
                                          mask,
                                          kargs.scale_s,
                                          variant,

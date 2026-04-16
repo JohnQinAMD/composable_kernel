@@ -121,6 +121,7 @@ struct fmha_vsa_fwd_args
     const void* lut_ptr; // delta-encoded K-block indices per Q-block, int32 [B,H,Q_blk,K_blk]
     const void* valid_block_num_ptr; // valid K-block count per Q-block, int32 [B,H,Q_blk]
     void* o_ptr;
+    void* lse_ptr = nullptr; // fp32 [B, H, seqlen_q]; may be nullptr when LSE output is disabled
 
     ck_tile::index_t seqlen_q;
     ck_tile::index_t seqlen_k;
@@ -141,14 +142,21 @@ struct fmha_vsa_fwd_args
     ck_tile::index_t nhead_stride_k;
     ck_tile::index_t nhead_stride_v;
     ck_tile::index_t nhead_stride_o;
+    ck_tile::index_t nhead_stride_lse = 0;
     ck_tile::index_t batch_stride_q;
     ck_tile::index_t batch_stride_k;
     ck_tile::index_t batch_stride_v;
     ck_tile::index_t batch_stride_o;
+    ck_tile::index_t batch_stride_lse = 0;
 
     ck_tile::index_t window_size_left;
     ck_tile::index_t window_size_right;
     ck_tile::index_t mask_type;
+
+    // Caller-side Q-block hint used by the fwd dispatcher to select
+    // between tile instances (block_m=64 → kM0=64 tile, block_m=128 →
+    // kM0=128 tile). Defaults to 128 for back-compat.
+    ck_tile::index_t block_m = 128;
 
     // Dropout is not supported for sparse attention; keep args minimal.
 };
@@ -199,6 +207,7 @@ auto fmha_fwd_create_kargs_and_grids(fmha_vsa_fwd_args args)
                                        args.lut_ptr,
                                        args.valid_block_num_ptr,
                                        args.o_ptr,
+                                       args.lse_ptr,
                                        args.seqlen_q,
                                        args.seqlen_k,
                                        args.hdim_q,
@@ -214,10 +223,12 @@ auto fmha_fwd_create_kargs_and_grids(fmha_vsa_fwd_args args)
                                        args.nhead_stride_k,
                                        args.nhead_stride_v,
                                        args.nhead_stride_o,
+                                       args.nhead_stride_lse,
                                        args.batch_stride_q,
                                        args.batch_stride_k,
                                        args.batch_stride_v,
                                        args.batch_stride_o,
+                                       args.batch_stride_lse,
                                        args.window_size_left,
                                        args.window_size_right,
                                        args.mask_type);
@@ -326,3 +337,4 @@ template <typename Traits_>
 float fmha_vsa_fwd_(const ck_tile::stream_config&, fmha_vsa_fwd_args);
 
 float fmha_vsa_fwd(fmha_vsa_fwd_args, const ck_tile::stream_config&);
+
