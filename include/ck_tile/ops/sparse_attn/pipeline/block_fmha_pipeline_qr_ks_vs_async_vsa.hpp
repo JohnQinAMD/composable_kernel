@@ -207,7 +207,13 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
         // (kM0=128, kN0=64 as patched for SLA), the LUT values are K-block
         // indices in units of kN0 and the subsequent iteration step at lines
         // 529-530 also uses kN0. The starting offset must match.
-        int seqlen_k_start = kv_block_idx_ptr[0] * kN0;
+        //
+        // O2: the LUT now stores ABSOLUTE K-block indices instead of
+        // delta-encoded ones. The inline `delta = curr - prev` subtraction
+        // below eliminates the host-side abs_to_delta HIP kernel launch
+        // (~7 us). prev_abs_idx is updated per iteration.
+        int prev_abs_idx   = kv_block_idx_ptr[0];
+        int seqlen_k_start = prev_abs_idx * kN0;
         auto q_dram_window = make_tile_window(q_dram_block_window_tmp.get_bottom_tensor_view(),
                                               q_dram_block_window_tmp.get_window_lengths(),
                                               q_dram_block_window_tmp.get_window_origin(),
@@ -336,7 +342,10 @@ struct BlockFmhaPipelineQRKSVSAsyncVSA
             async_load_fence();
             __builtin_amdgcn_s_barrier();
 
-            int block_idx = kv_block_idx_ptr[i_total_loops + 1];
+            // O2: LUT now carries absolute indices — compute delta inline.
+            int curr_abs_idx = kv_block_idx_ptr[i_total_loops + 1];
+            int block_idx    = curr_abs_idx - prev_abs_idx;
+            prev_abs_idx     = curr_abs_idx;
             auto v_buf    = load_tile(v_dram_window, number<-1>{}, bool_constant<false>{});
             __builtin_amdgcn_sched_barrier(0);
             { // tail
